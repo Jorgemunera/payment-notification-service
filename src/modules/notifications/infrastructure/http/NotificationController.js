@@ -43,7 +43,7 @@ class NotificationController {
     try {
       logger.info(`Obteniendo estado del servicio de notificaciones`);
 
-      const emailStatus = this.emailService.getStatus();
+      const emailStatus = await this.emailService.getStatus();
       const counts = await this.notificationRepository.countByStatus();
 
       res.status(200).json({
@@ -60,12 +60,14 @@ class NotificationController {
     try {
       logger.warn(`Simulando fallo del servicio de notificaciones`);
 
-      this.emailService.disable();
+      await this.emailService.disable();
+
+      const status = await this.emailService.getStatus();
 
       res.status(200).json({
         success: true,
         message: 'Servicio de notificaciones deshabilitado',
-        status: this.emailService.getStatus(),
+        status: status,
       });
 
     } catch (error) {
@@ -77,12 +79,14 @@ class NotificationController {
     try {
       logger.info(`Simulando recuperación del servicio de notificaciones`);
 
-      this.emailService.enable();
+      await this.emailService.enable();
+
+      const status = await this.emailService.getStatus();
 
       res.status(200).json({
         success: true,
         message: 'Servicio de notificaciones habilitado',
-        status: this.emailService.getStatus(),
+        status: status,
       });
 
     } catch (error) {

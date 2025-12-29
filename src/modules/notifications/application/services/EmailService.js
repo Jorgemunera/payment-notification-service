@@ -1,35 +1,65 @@
 const config = require('../../../../config');
 const { Logger } = require('../../../../shared/utils/logger');
+const { redis } = require('../../../../shared/infrastructure/cache/redis');
 const NotificationErrors = require('../../domain/errors/NotificationErrors');
 
 const logger = new Logger('SERVICE:EMAIL');
 
+// Clave en Redis para el estado del servicio
+const SERVICE_STATUS_KEY = 'notification:service:enabled';
+
 class EmailService {
   constructor() {
-    this.enabled = config.notifications.serviceEnabled;
+    // Inicializar el estado en Redis si no existe
+    this._initializeStatus();
   }
 
   /**
-   * Verifica si el servicio está habilitado
+   * Inicializa el estado del servicio en Redis
    */
-  isEnabled() {
-    return this.enabled;
+  async _initializeStatus() {
+    try {
+      const currentStatus = await redis.get(SERVICE_STATUS_KEY);
+      
+      if (currentStatus === null) {
+        // No existe, establecer valor inicial desde config
+        const initialValue = config.notifications.serviceEnabled ? 'true' : 'false';
+        await redis.set(SERVICE_STATUS_KEY, initialValue);
+        logger.info(`Estado inicial del servicio establecido en Redis: ${initialValue}`);
+      }
+    } catch (error) {
+      logger.error('Error inicializando estado del servicio en Redis', { error: error.message });
+    }
+  }
+
+  /**
+   * Verifica si el servicio está habilitado (consulta Redis)
+   */
+  async isEnabled() {
+    try {
+      const status = await redis.get(SERVICE_STATUS_KEY);
+      return status === 'true';
+    } catch (error) {
+      logger.error('Error consultando estado del servicio', { error: error.message });
+      // En caso de error de Redis, usar config como fallback
+      return config.notifications.serviceEnabled;
+    }
   }
 
   /**
    * Habilita el servicio (para simulación)
    */
-  enable() {
-    this.enabled = true;
-    logger.info('Servicio de email HABILITADO');
+  async enable() {
+    await redis.set(SERVICE_STATUS_KEY, 'true');
+    logger.info('Servicio de email HABILITADO (Redis actualizado)');
   }
 
   /**
    * Deshabilita el servicio (para simulación de fallo)
    */
-  disable() {
-    this.enabled = false;
-    logger.warn('Servicio de email DESHABILITADO');
+  async disable() {
+    await redis.set(SERVICE_STATUS_KEY, 'false');
+    logger.warn('Servicio de email DESHABILITADO (Redis actualizado)');
   }
 
   /**
@@ -44,8 +74,10 @@ class EmailService {
     // Simular latencia de red
     await this._simulateLatency();
 
-    // Verificar si el servicio está habilitado
-    if (!this.enabled) {
+    // Verificar si el servicio está habilitado (CONSULTA A REDIS)
+    const enabled = await this.isEnabled();
+    
+    if (!enabled) {
       logger.error(`Servicio de email no disponible`, { to, subject });
       throw new NotificationErrors.NotificationServiceUnavailableError(
         'El servicio de email no está disponible'
@@ -80,11 +112,12 @@ class EmailService {
   /**
    * Obtiene el estado actual del servicio
    */
-  getStatus() {
+  async getStatus() {
+    const enabled = await this.isEnabled();
     return {
       service: 'email',
-      enabled: this.enabled,
-      status: this.enabled ? 'operational' : 'unavailable',
+      enabled: enabled,
+      status: enabled ? 'operational' : 'unavailable',
     };
   }
 }
