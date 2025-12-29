@@ -27,51 +27,38 @@ class ProcessNotification {
       return notification;
     }
 
-    // 3. MARCAR COMO PROCESSING
+    // 3. MARCAR COMO PROCESSING E INCREMENTAR ATTEMPTS
     notification.markAsProcessing();
     await this.notificationRepository.update(notification);
 
-    logger.info(`Notificación marcada como PROCESSING`, { 
-      notificationId, 
+    logger.info(`Notificación marcada como PROCESSING`, {
+      notificationId,
       attempts: notification.attempts,
     });
 
-    try {
-      // 4. ENVIAR EMAIL
-      const formattedAmount = new Intl.NumberFormat('es-CO', {
-        style: 'currency',
-        currency: currency || 'COP',
-      }).format(amount);
+    // 4. ENVIAR EMAIL
+    const formattedAmount = new Intl.NumberFormat('es-CO', {
+      style: 'currency',
+      currency: currency || 'COP',
+    }).format(amount);
 
-      await this.emailService.send({
-        to: email,
-        subject: `Confirmación de pago ${paymentId}`,
-        body: `Su pago por ${formattedAmount} ha sido procesado exitosamente. ID de transacción: ${paymentId}`,
-      });
+    await this.emailService.send({
+      to: email,
+      subject: `Confirmación de pago ${paymentId}`,
+      body: `Su pago por ${formattedAmount} ha sido procesado exitosamente. ID de transacción: ${paymentId}`,
+    });
 
-      // 5. MARCAR COMO SENT
-      notification.markAsSent();
-      await this.notificationRepository.update(notification);
+    // 5. MARCAR COMO SENT
+    notification.markAsSent();
+    await this.notificationRepository.update(notification);
 
-      logger.info(`Notificación enviada exitosamente`, { 
-        notificationId, 
-        paymentId,
-        recipient: email,
-      });
+    logger.info(`Notificación enviada exitosamente`, {
+      notificationId,
+      paymentId,
+      recipient: email,
+    });
 
-      return notification;
-
-    } catch (error) {
-      // 6. MANEJAR ERROR
-      logger.error(`Error enviando notificación`, { 
-        notificationId, 
-        error: error.message,
-        attempts: notification.attempts,
-      });
-
-      // No actualizamos a FAILED aquí, eso lo hace el consumer después de los reintentos
-      throw error;
-    }
+    return notification;
   }
 }
 

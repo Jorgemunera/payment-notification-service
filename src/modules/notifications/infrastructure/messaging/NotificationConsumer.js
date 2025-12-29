@@ -1,4 +1,4 @@
-const { consume, getChannel } = require('../../../../shared/infrastructure/messaging/rabbitmq');
+const { getChannel } = require('../../../../shared/infrastructure/messaging/rabbitmq');
 const { QUEUES } = require('../../../../shared/infrastructure/messaging/setup');
 const { NotificationStatus } = require('../../domain/entities/Notification');
 const config = require('../../../../config');
@@ -31,7 +31,7 @@ class NotificationConsumer {
 
         try {
           event = JSON.parse(msg.content.toString());
-          
+
           logger.info(`═══════════════════════════════════════════════════════════`);
           logger.info(`📨 MENSAJE RECIBIDO`);
           logger.info(`───────────────────────────────────────────────────────────`);
@@ -40,84 +40,44 @@ class NotificationConsumer {
           logger.info(`   Notification ID: ${event.payload.notificationId}`);
           logger.info(`═══════════════════════════════════════════════════════════`);
 
-          // Obtener número de intentos del header
-          const retryCount = this._getRetryCount(msg);
           const isRetryFromDLQ = msg.properties.headers?.['x-retried-from-dlq'] || false;
-
-          logger.info(`Procesando notificación`, {
-            notificationId: event.payload.notificationId,
-            attempt: retryCount + 1,
-            maxRetries: this.maxRetries,
-            isRetryFromDLQ,
-          });
 
           // Si viene de DLQ, resetear la notificación para reintento
           if (isRetryFromDLQ) {
             await this._resetNotificationForRetry(event.payload.notificationId);
           }
 
-          // Procesar la notificación
-          await this.processNotificationUseCase.execute({
-            paymentId: event.payload.paymentId,
-            notificationId: event.payload.notificationId,
-            amount: event.payload.amount,
-            currency: event.payload.currency,
-            email: event.payload.email,
-          });
+          // Intentar procesar con reintentos internos
+          const success = await this._processWithRetries(event);
 
-          // ACK - mensaje procesado exitosamente
-          channel.ack(msg);
+          if (success) {
+            // ACK - mensaje procesado exitosamente
+            channel.ack(msg);
 
-          const duration = Date.now() - startTime;
-          logger.info(`✅ Mensaje procesado exitosamente`, {
-            notificationId: event.payload.notificationId,
-            duration: `${duration}ms`,
-          });
-
-        } catch (error) {
-          const retryCount = this._getRetryCount(msg);
-          
-          logger.error(`❌ Error procesando mensaje`, {
-            eventId: event?.id,
-            notificationId: event?.payload?.notificationId,
-            error: error.message,
-            attempt: retryCount + 1,
-            maxRetries: this.maxRetries,
-          });
-
-          if (retryCount < this.maxRetries - 1) {
-            // Aún hay reintentos disponibles
-            const delay = this._calculateBackoff(retryCount);
-            
-            logger.warn(`🔄 Reintentando en ${delay}ms`, {
-              notificationId: event?.payload?.notificationId,
-              nextAttempt: retryCount + 2,
+            const duration = Date.now() - startTime;
+            logger.info(`✅ Mensaje procesado exitosamente`, {
+              notificationId: event.payload.notificationId,
+              duration: `${duration}ms`,
             });
-
-            // Esperar antes de hacer NACK con requeue
-            await this._sleep(delay);
-            
-            // NACK con requeue - vuelve a la cola
-            channel.nack(msg, false, true);
-
           } else {
-            // Máximo de reintentos alcanzado
+            // Todos los reintentos fallaron - enviar a DLQ
             logger.error(`💀 Máximo de reintentos alcanzado, enviando a DLQ`, {
-              notificationId: event?.payload?.notificationId,
-              totalAttempts: retryCount + 1,
+              notificationId: event.payload.notificationId,
+              totalAttempts: this.maxRetries,
             });
-
-            // Marcar notificación como FAILED en la BD
-            if (event?.payload?.notificationId) {
-              await this._markNotificationAsFailed(
-                event.payload.notificationId,
-                error.message
-              );
-            }
 
             // NACK sin requeue - va a la DLQ
             channel.nack(msg, false, false);
           }
+
+        } catch (error) {
+          // Error inesperado (parsing, etc.)
+          logger.error(`❌ Error inesperado procesando mensaje`, {
+            error: error.message,
+          });
+
+          // NACK sin requeue - va a la DLQ
+          channel.nack(msg, false, false);
         }
       },
       { noAck: false }
@@ -127,14 +87,57 @@ class NotificationConsumer {
   }
 
   /**
-   * Obtiene el número de reintentos del mensaje
+   * Procesa la notificación con reintentos internos
+   * @returns {boolean} true si se procesó exitosamente, false si agotó reintentos
    */
-  _getRetryCount(msg) {
-    const deaths = msg.properties.headers?.['x-death'];
-    if (!deaths || deaths.length === 0) return 0;
-    
-    // Sumar todos los conteos de muerte
-    return deaths.reduce((acc, death) => acc + (death.count || 0), 0);
+  async _processWithRetries(event) {
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      try {
+        logger.info(`Procesando notificación`, {
+          notificationId: event.payload.notificationId,
+          attempt: attempt,
+          maxRetries: this.maxRetries,
+        });
+
+        await this.processNotificationUseCase.execute({
+          paymentId: event.payload.paymentId,
+          notificationId: event.payload.notificationId,
+          amount: event.payload.amount,
+          currency: event.payload.currency,
+          email: event.payload.email,
+        });
+
+        // Éxito
+        return true;
+
+      } catch (error) {
+        logger.error(`❌ Error en intento ${attempt}/${this.maxRetries}`, {
+          notificationId: event.payload.notificationId,
+          error: error.message,
+        });
+
+        if (attempt < this.maxRetries) {
+          // Calcular delay con backoff exponencial
+          const delay = this._calculateBackoff(attempt - 1);
+          
+          logger.warn(`🔄 Reintentando en ${delay}ms`, {
+            notificationId: event.payload.notificationId,
+            nextAttempt: attempt + 1,
+          });
+
+          await this._sleep(delay);
+        } else {
+          // Último intento falló - marcar como FAILED
+          await this._markNotificationAsFailed(
+            event.payload.notificationId,
+            error.message
+          );
+        }
+      }
+    }
+
+    // Todos los intentos fallaron
+    return false;
   }
 
   /**
@@ -160,11 +163,11 @@ class NotificationConsumer {
   async _markNotificationAsFailed(notificationId, errorMessage) {
     try {
       const notification = await this.notificationRepository.findById(notificationId);
-      
+
       if (notification) {
         notification.markAsFailed(errorMessage);
         await this.notificationRepository.update(notification);
-        
+
         logger.info(`Notificación marcada como FAILED`, { notificationId });
       }
     } catch (error) {
@@ -181,11 +184,11 @@ class NotificationConsumer {
   async _resetNotificationForRetry(notificationId) {
     try {
       const notification = await this.notificationRepository.findById(notificationId);
-      
+
       if (notification && notification.status === NotificationStatus.FAILED) {
         notification.resetForRetry();
         await this.notificationRepository.update(notification);
-        
+
         logger.info(`Notificación reseteada para reintento`, { notificationId });
       }
     } catch (error) {
