@@ -7,38 +7,81 @@ const logger = new Logger('RABBITMQ');
 let connection = null;
 let channel = null;
 
+// Configuración de reintentos
+const RETRY_CONFIG = {
+  maxRetries: 10,
+  initialDelayMs: 1000,
+  maxDelayMs: 30000,
+  factor: 2,
+};
+
 /**
- * Conecta a RabbitMQ y crea un canal
+ * Espera un tiempo determinado
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Calcula el delay con backoff exponencial
+ */
+function calculateBackoff(attempt) {
+  const delay = RETRY_CONFIG.initialDelayMs * Math.pow(RETRY_CONFIG.factor, attempt);
+  return Math.min(delay, RETRY_CONFIG.maxDelayMs);
+}
+
+/**
+ * Conecta a RabbitMQ con reintentos
  */
 async function connect() {
-  try {
-    logger.info('Conectando a RabbitMQ...');
-    
-    connection = await amqp.connect(config.rabbitmq.url);
-    channel = await connection.createChannel();
-    
-    // Prefetch: procesar un mensaje a la vez
-    await channel.prefetch(1);
-    
-    logger.info('Conectado a RabbitMQ');
-    
-    // Manejar errores de conexión
-    connection.on('error', (err) => {
-      logger.error('Error en conexión RabbitMQ', { error: err.message });
-    });
-    
-    connection.on('close', () => {
-      logger.warn('Conexión a RabbitMQ cerrada');
-      channel = null;
-      connection = null;
-    });
-    
-    return channel;
-    
-  } catch (error) {
-    logger.error('Error conectando a RabbitMQ', { error: error.message });
-    throw error;
+  let lastError;
+
+  for (let attempt = 0; attempt < RETRY_CONFIG.maxRetries; attempt++) {
+    try {
+      logger.info(`Conectando a RabbitMQ... (intento ${attempt + 1}/${RETRY_CONFIG.maxRetries})`);
+      
+      connection = await amqp.connect(config.rabbitmq.url);
+      channel = await connection.createChannel();
+      
+      // Prefetch: procesar un mensaje a la vez
+      await channel.prefetch(1);
+      
+      logger.info('✅ Conectado a RabbitMQ exitosamente');
+      
+      // Manejar errores de conexión
+      connection.on('error', (err) => {
+        logger.error('Error en conexión RabbitMQ', { error: err.message });
+      });
+      
+      connection.on('close', () => {
+        logger.warn('Conexión a RabbitMQ cerrada');
+        channel = null;
+        connection = null;
+      });
+      
+      return channel;
+      
+    } catch (error) {
+      lastError = error;
+      
+      if (attempt < RETRY_CONFIG.maxRetries - 1) {
+        const delay = calculateBackoff(attempt);
+        logger.warn(`Error conectando a RabbitMQ, reintentando en ${delay}ms...`, {
+          error: error.message,
+          attempt: attempt + 1,
+          maxRetries: RETRY_CONFIG.maxRetries,
+        });
+        await sleep(delay);
+      }
+    }
   }
+
+  logger.error('No se pudo conectar a RabbitMQ después de todos los reintentos', {
+    error: lastError.message,
+    totalAttempts: RETRY_CONFIG.maxRetries,
+  });
+  
+  throw lastError;
 }
 
 /**
